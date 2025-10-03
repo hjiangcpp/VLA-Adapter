@@ -874,6 +874,11 @@ def aloha_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     return trajectory
 
 
+# Custom fine-tuning dataset transform (no-op)
+def black_object_pick_and_place_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    return trajectory
+
+
 # === Registry ===
 OXE_STANDARDIZATION_TRANSFORMS = {
     "bridge_oxe": bridge_oxe_dataset_transform,
@@ -960,4 +965,5 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "aloha1_fold_shirt_30_demos": aloha_dataset_transform,
     "aloha1_scoop_X_into_bowl_45_demos": aloha_dataset_transform,
     "aloha1_put_X_into_pot_300_demos": aloha_dataset_transform,
+    "black_object_pick_and_place": black_object_pick_and_place_dataset_transform,
 }

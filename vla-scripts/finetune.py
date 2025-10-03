@@ -57,8 +57,246 @@ from prismatic.vla.constants import (
 from prismatic.vla.datasets import RLDSDataset, RLDSBatchTransform
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 from prismatic.models import load, load_vla
+import json, os, pandas as pd, cv2
+from pathlib import Path
+from torch.utils.data import IterableDataset
+from itertools import islice
+
+class LeRobotRLDSDataset(IterableDataset):
+    def __init__(self, root: str, dataset_name: str, batch_transform: RLDSBatchTransform, use_wrist: bool = True, resize: tuple | None = None, train: bool = True):
+        self.ds_dir = Path(root) / dataset_name
+        self.dataset_name = dataset_name
+        self.batch_transform = batch_transform
+        info = json.load(open(self.ds_dir / "meta" / "info.json"))
+        self.fps = info.get("fps", 10)
+        self.data_tpl = info["data_path"]
+        self.video_tpl = info["video_path"]
+        # Load episode metadata early so it's always defined
+        self.episodes = [json.loads(l) for l in open(self.ds_dir / "meta" / "episodes.jsonl")]
+        # Precompute simple dataset statistics for saving/checkpointing compatibility
+        # Expected format by downstream utils:
+        # { any_key: {"action": {mean,std,min,max,q01,q99}, "proprio": {...}, "num_transitions": int, "num_trajectories": int} }
+        try:
+            import numpy as np
+            actions_list, proprios_list = [], []
+            num_transitions, num_trajectories = 0, 0
+            total_rows = 0
+            episodes_meta_path = self.ds_dir / "meta" / "episodes.jsonl"
+            if episodes_meta_path.exists():
+                with open(episodes_meta_path, "r") as f:
+                    episodes_iter = [json.loads(l) for l in f]
+            else:
+                episodes_iter = []
+            for ep in episodes_iter:
+                epi_idx = ep["episode_index"]
+                chunk_idx = epi_idx // 1000
+                df_path = self.ds_dir / self.data_tpl.format(episode_chunk=chunk_idx, episode_index=epi_idx)
+                if not df_path.exists():
+                    continue
+                df = pd.read_parquet(df_path)
+                if "action" in df:
+                    a = df["action"].to_numpy()
+                    if a is not None and len(a) > 0:
+                        actions_list.append(a)
+                        num_transitions += len(a)
+                if "observation.state" in df:
+                    p = df["observation.state"].to_numpy()
+                    if p is not None and len(p) > 0:
+                        proprios_list.append(p)
+                total_rows += len(df)
+                num_trajectories += 1
+
+            # Fallback to zeros if missing to keep shape compatibility during save
+            if len(actions_list) > 0:
+                actions_arr = np.concatenate(actions_list, axis=0)
+            else:
+                actions_arr = np.zeros((1, ACTION_DIM), dtype=float)
+            if len(proprios_list) > 0:
+                proprios_arr = np.concatenate(proprios_list, axis=0)
+            else:
+                proprios_arr = np.zeros((1, PROPRIO_DIM), dtype=float)
+
+            def stats_of(arr):
+                arr_np = np.asarray(arr)
+                return {
+                    "mean": arr_np.mean(0).tolist(),
+                    "std": arr_np.std(0).tolist(),
+                    "max": arr_np.max(0).tolist(),
+                    "min": arr_np.min(0).tolist(),
+                    "q01": np.quantile(arr_np, 0.01, axis=0).tolist(),
+                    "q99": np.quantile(arr_np, 0.99, axis=0).tolist(),
+                }
+
+            self.dataset_statistics = {
+                dataset_name: {
+                    "action": stats_of(actions_arr),
+                    "proprio": stats_of(proprios_arr),
+                    "num_transitions": int(num_transitions),
+                    "num_trajectories": int(num_trajectories),
+                }
+            }
+            # Cache dataset length for PyTorch DataLoader len() calls
+            # Prefer number of rows seen across episodes; fallback to num_transitions
+            self._length = int(total_rows) if total_rows > 0 else int(num_transitions)
+        except Exception:
+            # In case of any unexpected format issues, provide a minimal placeholder to avoid crashes
+            # Downstream code mainly requires presence for saving; real normalization is unused here
+            self.dataset_statistics = {
+                dataset_name: {
+                    "action": {"mean": [0.0]*ACTION_DIM, "std": [1.0]*ACTION_DIM, "max": [0.0]*ACTION_DIM, "min": [0.0]*ACTION_DIM, "q01": [0.0]*ACTION_DIM, "q99": [0.0]*ACTION_DIM},
+                    "proprio": {"mean": [0.0]*PROPRIO_DIM, "std": [1.0]*PROPRIO_DIM, "max": [0.0]*PROPRIO_DIM, "min": [0.0]*PROPRIO_DIM, "q01": [0.0]*PROPRIO_DIM, "q99": [0.0]*PROPRIO_DIM},
+                    "num_transitions": 0,
+                    "num_trajectories": 0,
+                }
+            }
+            self._length = len(self.episodes)
+        def has_cam(key: str) -> bool:
+            # Accept both layouts:
+            # 1) videos/<video_key>/chunk-000/...
+            # 2) videos/chunk-000/<video_key>/...
+            return (
+                (self.ds_dir / "videos" / key / "chunk-000").exists()
+                or (self.ds_dir / "videos" / "chunk-000" / key).exists()
+                or (self.ds_dir / "videos" / key).exists()
+            )
+        # Optional override: set env LEROBOT_PRIMARY_KEY to force a specific primary, e.g., "observation.images.top"
+        primary_override = os.environ.get("LEROBOT_PRIMARY_KEY")
+        if primary_override and has_cam(primary_override):
+            self.primary_key = primary_override
+        elif has_cam("observation.images.front"):
+            self.primary_key = "observation.images.front"
+        elif has_cam("observation.images.cam_high"):
+            self.primary_key = "observation.images.cam_high"
+        elif has_cam("observation.images.top"):
+            self.primary_key = "observation.images.top"
+        else:
+            raise FileNotFoundError("No primary camera found (front/cam_high/top).")
+        if has_cam("observation.images.hand"):
+            self.wrist_key = "observation.images.hand"
+        elif has_cam("observation.images.cam_left_wrist"):
+            self.wrist_key = "observation.images.cam_left_wrist"
+        elif has_cam("observation.images.cam_right_wrist"):
+            self.wrist_key = "observation.images.cam_right_wrist"
+        else:
+            self.wrist_key = None
+        self.use_wrist = use_wrist and self.wrist_key is not None
+        self.resize = resize
+        self.episodes = [json.loads(l) for l in open(self.ds_dir / "meta" / "episodes.jsonl")]
+
+    def _open_video(self, chunk_idx: int, epi_idx: int, key: str):
+        rel = self.video_tpl.format(episode_chunk=chunk_idx, video_key=key, episode_index=epi_idx)
+        return cv2.VideoCapture(str(self.ds_dir / rel))
+
+    def _frame_iterator(self, chunk_idx: int, epi_idx: int, key: str):
+        """Yield RGB frames using OpenCV; on failure (e.g., AV1), fall back to PyAV if available."""
+        rel = self.video_tpl.format(episode_chunk=chunk_idx, video_key=key, episode_index=epi_idx)
+        path = str(self.ds_dir / rel)
+
+        # Try OpenCV first
+        cap = cv2.VideoCapture(path)
+        ok, frame = cap.read()
+        if ok:
+            while True:
+                img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                yield img
+                ok, frame = cap.read()
+                if not ok:
+                    break
+            cap.release()
+            return
+
+        # Fallback to PyAV for codecs like AV1
+        try:
+            import av
+            with av.open(path) as container:
+                video_stream = next((s for s in container.streams if s.type == "video"), None)
+                if video_stream is None:
+                    return
+                for frame in container.decode(video_stream):
+                    img = frame.to_ndarray(format="rgb24")
+                    yield img
+        except Exception:
+            # If PyAV is not available or fails, give up and yield nothing
+            return
+
+    def __iter__(self):
+        import numpy as np
+        for ep in self.episodes:
+            epi_idx = ep["episode_index"]
+            chunk_idx = epi_idx // 1000
+            df_path = self.ds_dir / self.data_tpl.format(episode_chunk=chunk_idx, episode_index=epi_idx)
+            df = pd.read_parquet(df_path)
+            actions = None
+            proprios = None
+            if "action" in df:
+                actions_col = df["action"].to_numpy()
+                try:
+                    # Convert object array of per-step vectors -> (T, ACTION_DIM) float array
+                    actions = np.stack(list(actions_col)).astype(np.float32)
+                except Exception:
+                    actions = np.asarray(actions_col, dtype=np.float32)
+            if "observation.state" in df:
+                proprio_col = df["observation.state"].to_numpy()
+                try:
+                    proprios = np.stack(list(proprio_col)).astype(np.float32)
+                except Exception:
+                    proprios = np.asarray(proprio_col, dtype=np.float32)
+            lang = ep["tasks"][0] if "tasks" in ep and ep["tasks"] else ""
+            prim_iter = self._frame_iterator(chunk_idx, epi_idx, self.primary_key)
+            wrist_iter = self._frame_iterator(chunk_idx, epi_idx, self.wrist_key) if self.use_wrist else None
+            t = 0
+            for img_p in prim_iter:
+                if self.resize is not None:
+                    img_p = cv2.resize(img_p, (self.resize[1], self.resize[0]))
+                img_w = None
+                if wrist_iter is not None:
+                    try:
+                        img_w = next(wrist_iter)
+                        if self.resize is not None and img_w is not None:
+                            img_w = cv2.resize(img_w, (self.resize[1], self.resize[0]))
+                    except StopIteration:
+                        break
+
+                # Build action window [current + future]
+                if actions is None or t >= len(actions):
+                    break
+                window = actions[t : t + NUM_ACTIONS_CHUNK]
+                if len(window) < NUM_ACTIONS_CHUNK:
+                    pad_len = NUM_ACTIONS_CHUNK - len(window)
+                    feat_dim = actions.shape[1] if actions.ndim == 2 else ACTION_DIM
+                    pad = np.zeros((pad_len, feat_dim), dtype=actions.dtype if hasattr(actions, 'dtype') else np.float32)
+                    window = np.concatenate([window, pad], axis=0)
+
+                # RLDS-like batch expected by RLDSBatchTransform
+                rlds_batch = {
+                    "dataset_name": self.dataset_name,
+                    "action": window,  # shape: [NUM_ACTIONS_CHUNK, ACTION_DIM]
+                    "observation": {
+                        "image_primary": np.expand_dims(img_p, axis=0),
+                    },
+                    "task": {"language_instruction": lang.encode() if isinstance(lang, str) else lang},
+                }
+                if img_w is not None:
+                    # Any key containing 'wrist' will be picked up as wrist image by the transform
+                    rlds_batch["observation"]["image_wrist"] = np.expand_dims(img_w, axis=0)
+                if proprios is not None and t < len(proprios):
+                    # Provide current-step proprio as numpy float32 for downstream collator stacking
+                    proprio_vec = np.asarray(proprios[t], dtype=np.float32).reshape(-1)
+                    # Ensure expected size (PROPRIO_DIM); pad with zeros or truncate if mismatched
+                    if proprio_vec.shape[0] < PROPRIO_DIM:
+                        proprio_vec = np.pad(proprio_vec, (0, PROPRIO_DIM - proprio_vec.shape[0]))
+                    elif proprio_vec.shape[0] > PROPRIO_DIM:
+                        proprio_vec = proprio_vec[:PROPRIO_DIM]
+                    rlds_batch["observation"]["proprio"] = proprio_vec
+
+                # Apply provided batch transform to produce model-ready sample
+                yield self.batch_transform(rlds_batch)
+                t += 1
 
 
+# Provide length for IterableDataset so that len(dataloader) works
+    def __len__(self):
+        return int(getattr(self, "_length", len(self.episodes)))
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -838,6 +1076,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             init_lora_weights="gaussian",
         )
         vla = get_peft_model(vla, lora_config)
+        # When resuming, load LoRA adapter weights from the checkpoint directory
+        if cfg.resume:
+            adapter_dir_path = os.path.join(cfg.resum_vla_path, "lora_adapter")
+            if os.path.isdir(adapter_dir_path):
+                vla = PeftModel.from_pretrained(vla, adapter_dir_path)
         for name, param in vla.named_parameters():
             if "action_queries" in name:
                 param.requires_grad = True
@@ -958,24 +1201,22 @@ def finetune(cfg: FinetuneConfig) -> None:
         use_proprio=cfg.use_proprio,
         use_minivlm=cfg.use_minivlm
         )
-    train_dataset = RLDSDataset(
-        cfg.data_root_dir,
-        cfg.dataset_name,
-        batch_transform,
-        resize_resolution=tuple(vla.module.config.image_sizes),
-        shuffle_buffer_size=cfg.shuffle_buffer_size,
-        image_aug=cfg.image_aug,
-    )
-    if cfg.use_val_set:
-        val_dataset = RLDSDataset(
-            cfg.data_root_dir,
-            cfg.dataset_name,
-            batch_transform,
-            resize_resolution=tuple(vla.module.config.image_sizes),
-            shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
-            image_aug=cfg.image_aug,
-            train=False,
+    train_dataset = LeRobotRLDSDataset(
+        root=str(cfg.data_root_dir),
+        dataset_name=cfg.dataset_name,
+        batch_transform=batch_transform,
+        use_wrist=use_wrist_image,
+        resize=tuple(vla.module.config.image_sizes)[-2:],  # (H, W)
         )
+    if cfg.use_val_set:
+        val_dataset = LeRobotRLDSDataset(
+            root=str(cfg.data_root_dir),
+            dataset_name=cfg.dataset_name,
+            batch_transform=batch_transform,
+            use_wrist=use_wrist_image,
+            resize=tuple(vla.module.config.image_sizes)[-2:],  # (H, W)
+            train=False,
+            )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
     if distributed_state.is_main_process:

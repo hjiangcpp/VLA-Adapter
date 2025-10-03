@@ -720,4 +720,18 @@ OXE_DATASET_CONFIGS = {
         "state_encoding": StateEncoding.JOINT_BIMANUAL,
         "action_encoding": ActionEncoding.JOINT_POS_BIMANUAL,
     },
+    "black_object_pick_and_place": {
+        "image_obs_keys": {
+            "primary": "observation.images.front",
+            "secondary": "observation.images.top",
+            "wrist": "observation.images.hand",
+        },
+        "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
+        # 如果没有关节/EEF状态，就先不喂入proprio；后面用开关禁用即可
+        "state_obs_keys": ["observation.state", None],
+        "state_encoding": StateEncoding.JOINT,
+        # 你的遥操作通常是 EEF 增量 + 抓手开合，如果确认是这种，保持 EEF_POS
+        # 若是关节角增量，请改为 JOINT_POS，并把 state_encoding 也改为 JOINT
+        "action_encoding": ActionEncoding.JOINT_POS,
+    },
 }
