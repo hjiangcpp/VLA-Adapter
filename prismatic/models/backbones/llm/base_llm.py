@@ -119,10 +119,13 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
         #   => Note: We're eschewing use of the AutoModel API so that we can be more explicit about LLM-specific details
         if not self.inference_mode:
             overwatch.info(f"Loading [bold]{llm_family}[/] LLM from [underline]`{hf_hub_path}`[/]", ctx_level=1)
+            print("########################################hf_hub_path", hf_hub_path)
+            hf_hub_path = "/home/hhjiang/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B"
             self.llm = llm_cls.from_pretrained(
                 hf_hub_path,
                 token=hf_token,
                 use_flash_attention_2=use_flash_attention_2 if not self.inference_mode else False,
+                local_files_only=True,
                 # The following parameters are set to prevent `UserWarnings` from HF; we want greedy decoding!
                 do_sample=False,
                 temperature=1.0,
