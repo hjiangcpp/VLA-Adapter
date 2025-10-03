@@ -151,3 +151,18 @@ data/
 # Rollout videos and wandb logs
 rollouts/
 wandb/
+
+# Logs
+logs/
+
+# Weights and Biases
+wandb/
+
+# Pretrained Models
+pretrained_models/
+
+# Outputs
+outputs/
+
+# Eval Logs
+eval_logs/
