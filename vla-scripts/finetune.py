@@ -1258,6 +1258,14 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
+            if batch is None:
+                print(f"Dataset exhausted at batch_idx {batch_idx}")
+                break
+            
+            # 每100个batch打印进度
+            if batch_idx % 100 == 0:
+                print(f"Processing batch {batch_idx}, total samples seen: {batch_idx * cfg.batch_size}")
+
             # Compute training metrics and loss
             compute_diffusion_l1 = (cfg.use_l1_regression and batch_idx % cfg.diffusion_sample_freq == 0) or (cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0)
             loss, metrics = run_forward_pass(
