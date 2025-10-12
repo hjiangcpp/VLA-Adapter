@@ -53,11 +53,22 @@ BRIDGE_CONSTANTS = {
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
 
+LEROBOT_CONSTANTS = {
+    "NUM_ACTIONS_CHUNK": 8,
+    "ACTION_DIM": 6,
+    "PROPRIO_DIM": 6,
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
+}
 
 # Function to detect robot platform from command line arguments
-def detect_robot_platform():
+def detect_robot_platform(config_platform=None):
+    # 如果提供了配置参数，直接使用
+    if config_platform and config_platform.upper() in ["LIBERO", "ALOHA", "BRIDGE", "CALVIN", "LEROBOT"]:
+        return config_platform.upper()
+    
+    # 备用：通过命令行参数检测
     cmd_args = " ".join(sys.argv).lower()
-
+    
     if "libero" in cmd_args:
         return "LIBERO"
     elif "aloha" in cmd_args:
@@ -66,6 +77,8 @@ def detect_robot_platform():
         return "BRIDGE"
     elif "calvin" in cmd_args:
         return "CALVIN"
+    elif "lerobot" in cmd_args:
+        return "LEROBOT"
     else:
         # Default to LIBERO if unclear
         return "LIBERO"
@@ -83,6 +96,8 @@ elif ROBOT_PLATFORM == "BRIDGE":
     constants = BRIDGE_CONSTANTS
 elif ROBOT_PLATFORM == "CALVIN":
     constants = CALVIN_CONSTANTS
+elif ROBOT_PLATFORM == "LEROBOT":
+    constants = LEROBOT_CONSTANTS
 
 # Assign constants to global variables
 NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]

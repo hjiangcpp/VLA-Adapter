@@ -104,6 +104,9 @@ class FinetuneConfig:
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
+    # Robot platform
+    robot_platform: str = "LIBERO"                   # Robot platform: LIBERO, ALOHA, BRIDGE, CALVIN, LEROBOT
+
     # LoRA
     use_lora: bool = False                           # If True, uses LoRA fine-tuning
     lora_rank: int = 32                              # Rank of LoRA weight matrix
