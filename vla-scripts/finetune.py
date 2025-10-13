@@ -5,7 +5,10 @@ Fine-tunes Qwen2.5-0.5B via LoRA.
 """
 
 import os
+import sys
 import time
+import warnings
+import contextlib
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -138,6 +141,7 @@ class LeRobotRLDSDataset(IterableDataset):
             # Cache dataset length for PyTorch DataLoader len() calls
             # Prefer number of rows seen across episodes; fallback to num_transitions
             self._length = int(total_rows) if total_rows > 0 else int(num_transitions)
+            print(f"Dataset computed length: {self._length} (total_rows: {total_rows}, num_transitions: {num_transitions})")
         except Exception:
             # In case of any unexpected format issues, provide a minimal placeholder to avoid crashes
             # Downstream code mainly requires presence for saving; real normalization is unused here
@@ -150,6 +154,7 @@ class LeRobotRLDSDataset(IterableDataset):
                 }
             }
             self._length = len(self.episodes)
+            print(f"Dataset fallback length: {self._length} (num_episodes: {len(self.episodes)})")
         def has_cam(key: str) -> bool:
             # Accept both layouts:
             # 1) videos/<video_key>/chunk-000/...
@@ -185,36 +190,39 @@ class LeRobotRLDSDataset(IterableDataset):
 
     def _open_video(self, chunk_idx: int, epi_idx: int, key: str):
         rel = self.video_tpl.format(episode_chunk=chunk_idx, video_key=key, episode_index=epi_idx)
-        return cv2.VideoCapture(str(self.ds_dir / rel))
+        with suppress_stderr():
+            return cv2.VideoCapture(str(self.ds_dir / rel))
 
     def _frame_iterator(self, chunk_idx: int, epi_idx: int, key: str):
         """Yield RGB frames using OpenCV; on failure (e.g., AV1), fall back to PyAV if available."""
         rel = self.video_tpl.format(episode_chunk=chunk_idx, video_key=key, episode_index=epi_idx)
         path = str(self.ds_dir / rel)
 
-        # Try OpenCV first
-        cap = cv2.VideoCapture(path)
-        ok, frame = cap.read()
-        if ok:
-            while True:
-                img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                yield img
-                ok, frame = cap.read()
-                if not ok:
-                    break
-            cap.release()
-            return
+        # Try OpenCV first - suppress AV1/codec warnings
+        with suppress_stderr():
+            cap = cv2.VideoCapture(path)
+            ok, frame = cap.read()
+            if ok:
+                while True:
+                    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    yield img
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                cap.release()
+                return
 
         # Fallback to PyAV for codecs like AV1
         try:
             import av
-            with av.open(path) as container:
-                video_stream = next((s for s in container.streams if s.type == "video"), None)
-                if video_stream is None:
-                    return
-                for frame in container.decode(video_stream):
-                    img = frame.to_ndarray(format="rgb24")
-                    yield img
+            with suppress_stderr():
+                with av.open(path) as container:
+                    video_stream = next((s for s in container.streams if s.type == "video"), None)
+                    if video_stream is None:
+                        return
+                    for frame in container.decode(video_stream):
+                        img = frame.to_ndarray(format="rgb24")
+                        yield img
         except Exception:
             # If PyAV is not available or fails, give up and yield nothing
             return
@@ -296,10 +304,29 @@ class LeRobotRLDSDataset(IterableDataset):
 
 # Provide length for IterableDataset so that len(dataloader) works
     def __len__(self):
-        return int(getattr(self, "_length", len(self.episodes)))
+        print("Dataset length called: ", self._length)
+        return self._length
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Suppress IterableDataset length warnings
+warnings.filterwarnings("ignore", message="Length of IterableDataset.*was reported.*", category=UserWarning)
+
+# Suppress OpenCV/FFmpeg AV1 warnings
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+os.environ["FFMPEG_LOG_LEVEL"] = "ERROR"
+
+# Context manager to suppress stderr output
+@contextlib.contextmanager
+def suppress_stderr():
+    with open(os.devnull, "w") as devnull:
+        old_stderr = sys.stderr
+        sys.stderr = devnull
+        try:
+            yield
+        finally:
+            sys.stderr = old_stderr
 
 @dataclass
 class FinetuneConfig:
@@ -1226,14 +1253,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     collator = PaddedCollatorForActionPrediction(
         processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
     )
-    dataloader = DataLoader(
-        train_dataset,
-        batch_size=cfg.batch_size,
-        sampler=None,
-        collate_fn=collator,
-        num_workers=0,  # Important: Set to 0 if using RLDS, which uses its own parallelism
-    )
-    print('Len of dataloader: ', len(dataloader))
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Length of IterableDataset.*was reported.*", category=UserWarning)
+        dataloader = DataLoader(
+            train_dataset,
+            batch_size=cfg.batch_size,
+            sampler=None,
+            collate_fn=collator,
+            num_workers=0,  # Important: Set to 0 if using RLDS, which uses its own parallelism
+        )
+        print('Len of dataloader: ', len(dataloader))
     if cfg.use_val_set:
         val_batch_size = cfg.batch_size
         val_dataloader = DataLoader(
