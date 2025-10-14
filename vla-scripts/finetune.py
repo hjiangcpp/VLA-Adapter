@@ -229,11 +229,35 @@ class LeRobotRLDSDataset(IterableDataset):
 
     def __iter__(self):
         import numpy as np
-        for ep in self.episodes:
+        import itertools
+        episode_count = 0
+        frame_count = 0
+        seen_episodes = set()
+        
+        # Cycle infinitely over episodes until training stops
+        for ep in itertools.cycle(self.episodes):
+            episode_count += 1
             epi_idx = ep["episode_index"]
+            seen_episodes.add(epi_idx)
+            
+            # After first complete cycle, print summary
+            if len(seen_episodes) == len(self.episodes) and episode_count == len(self.episodes):
+                print(f"Completed first cycle through all {len(self.episodes)} episodes. Starting second cycle...")
+            
             chunk_idx = epi_idx // 1000
             df_path = self.ds_dir / self.data_tpl.format(episode_chunk=chunk_idx, episode_index=epi_idx)
-            df = pd.read_parquet(df_path)
+            
+            # Check if data file exists
+            if not df_path.exists():
+                print(f"Warning: Episode {epi_idx} data file not found: {df_path}")
+                continue
+                
+            try:
+                df = pd.read_parquet(df_path)
+            except Exception as e:
+                print(f"Error loading episode {epi_idx}: {e}")
+                continue
+                
             actions = None
             proprios = None
             if "action" in df:
@@ -250,9 +274,16 @@ class LeRobotRLDSDataset(IterableDataset):
                 except Exception:
                     proprios = np.asarray(proprio_col, dtype=np.float32)
             lang = ep["tasks"][0] if "tasks" in ep and ep["tasks"] else ""
+            
+            # Debug: Print episode info every 10 episodes
+            if episode_count % 10 == 1:
+                print(f"Processing episode {epi_idx} (cycle #{episode_count}), frames so far: {frame_count}")
+            
             prim_iter = self._frame_iterator(chunk_idx, epi_idx, self.primary_key)
             wrist_iter = self._frame_iterator(chunk_idx, epi_idx, self.wrist_key) if self.use_wrist else None
             t = 0
+            episode_frames = 0
+            
             for img_p in prim_iter:
                 if self.resize is not None:
                     img_p = cv2.resize(img_p, (self.resize[1], self.resize[0]))
@@ -300,12 +331,31 @@ class LeRobotRLDSDataset(IterableDataset):
                 # Apply provided batch transform to produce model-ready sample
                 yield self.batch_transform(rlds_batch)
                 t += 1
+                frame_count += 1
+                episode_frames += 1
+                
+                # Debug: Print frame count every 500 frames
+                if frame_count % 500 == 0:
+                    print(f"Yielded {frame_count} frames total, episode {epi_idx} frame {episode_frames}")
+            
+            # Debug: Print episode completion info
+            if episode_frames > 0:
+                print(f"Completed episode {epi_idx} with {episode_frames} frames, total frames: {frame_count}")
 
 
 # Provide length for IterableDataset so that len(dataloader) works
     def __len__(self):
-        print("Dataset length called: ", self._length)
-        return self._length
+        # Calculate actual total frames across all episodes
+        total_frames = 0
+        for ep in self.episodes:
+            epi_idx = ep["episode_index"]
+            chunk_idx = epi_idx // 1000
+            df_path = self.ds_dir / self.data_tpl.format(episode_chunk=chunk_idx, episode_index=epi_idx)
+            if df_path.exists():
+                df = pd.read_parquet(df_path)
+                total_frames += len(df)
+        print(f"Dataset length called - Total frames: {total_frames}, Episodes: {len(self.episodes)}")
+        return total_frames
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -1239,6 +1289,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         use_wrist=use_wrist_image,
         resize=tuple(vla.module.config.image_sizes)[-2:],  # (H, W)
         )
+    print(f"[DEBUG] Dataset length (total frames): {len(train_dataset)}")
+    print(f"[DEBUG] Number of episodes: {len(train_dataset.episodes)}")
+    print(f"[DEBUG] Dataset statistics: {train_dataset.dataset_statistics}")
     if cfg.use_val_set:
         val_dataset = LeRobotRLDSDataset(
             root=str(cfg.data_root_dir),
