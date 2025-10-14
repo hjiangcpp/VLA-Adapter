@@ -381,8 +381,8 @@ class FinetuneConfig:
     use_fz: bool = False                             # If True, uses LoRA fine-tuning
 
     # Logging
-    wandb_entity: str = "jhuanhustc-uf"              # Name of WandB entity
-    wandb_project: str = "vla-adapter"               # Name of WandB project
+    wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
+    wandb_project: str = "your-wandb-project"        # Name of WandB project
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
@@ -995,7 +995,6 @@ def finetune(cfg: FinetuneConfig) -> None:
     if distributed_state.is_main_process:
         wandb.init(
             project=cfg.wandb_project, 
-            entity=cfg.wandb_entity,
             name=f"ft+{run_id}", 
             mode="online"
         )
