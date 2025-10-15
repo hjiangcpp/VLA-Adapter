@@ -370,13 +370,93 @@ os.environ["FFMPEG_LOG_LEVEL"] = "ERROR"
 # Context manager to suppress stderr output
 @contextlib.contextmanager
 def suppress_stderr():
-    with open(os.devnull, "w") as devnull:
-        old_stderr = sys.stderr
-        sys.stderr = devnull
-        try:
+    """Suppress Python-level and C/FFmpeg-level stderr output.
+
+    The previous version only reassigned sys.stderr; FFmpeg writes directly to the
+    underlying file descriptor (fd=2), so we also dup/redirect the OS-level fd.
+    """
+    # Duplicate original stderr file descriptor
+    old_stderr_fd = os.dup(2)
+    old_stderr_obj = sys.stderr
+    try:
+        with open(os.devnull, "w") as devnull:
+            # Redirect low-level fd 2 to /dev/null
+            os.dup2(devnull.fileno(), 2)
+            # Also redirect Python sys.stderr
+            sys.stderr = devnull
             yield
-        finally:
-            sys.stderr = old_stderr
+    finally:
+        # Restore low-level fd
+        os.dup2(old_stderr_fd, 2)
+        os.close(old_stderr_fd)
+        # Restore Python stderr object
+        sys.stderr = old_stderr_obj
+
+# Optional global warning / noisy library log suppression
+def configure_warning_suppression(enable: bool = True) -> None:
+    """Configure targeted suppression of noisy logs/warnings from TensorFlow, PyAV/FFmpeg, OpenCV, and PyTorch.
+
+    This keeps training logs clean while preserving critical error messages. Controlled via
+    FinetuneConfig.suppress_warnings (default True). Can also be forced by env var SUPPRESS_VLA_WARNINGS=0/1.
+
+    Args:
+        enable (bool): Whether to activate suppression.
+    """
+    if not enable:
+        return
+
+    # Respect environment override (set SUPPRESS_VLA_WARNINGS=0 to disable even if config enables)
+    if os.environ.get("SUPPRESS_VLA_WARNINGS", "1") != "1":
+        return
+
+    # Generic Python warnings filtering (add patterns as needed)
+    warnings.filterwarnings("ignore", message=r".*IterableDataset.*reported.*", category=UserWarning)
+    warnings.filterwarnings("ignore", message=r".*oneDNN custom operations are on.*")
+    warnings.filterwarnings("ignore", message=r".*Could not find TensorRT.*")
+
+    # TensorFlow / XLA verbose logs (must be set before TF import; we set here early)
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")  # 0=all,1=INFO removed,2=INFO+WARNING,3=+ERROR (still shows fatal)
+    os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")  # Remove oneDNN optimization banner
+
+    # Tokenizers parallelism banner
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    # OpenCV logging (Python API)
+    try:
+        import cv2
+        if hasattr(cv2, "setLogLevel"):
+            # cv2.setLogLevel( cv2.LOG_LEVEL_ERROR ) for recent versions
+            cv2.setLogLevel(0)  # 0 = ERROR, fallback; OpenCV < 4.5 may not expose constants
+        elif hasattr(cv2, "utils") and hasattr(cv2.utils, "logging") and hasattr(cv2.utils.logging, "setLogLevel"):
+            cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+    except Exception:
+        pass
+
+    # PyAV / FFmpeg log level
+    try:
+        import av
+        import av.logging as av_logging
+        # Map to highest severity to drop warnings (options: QUIET, PANIC, FATAL, ERROR, WARNING, INFO, VERBOSE, DEBUG, TRACE)
+        for lvl in ["FATAL", "ERROR", "PANIC", "QUIET"]:
+            if hasattr(av_logging, lvl):
+                av_logging.set_level(getattr(av_logging, lvl))
+                break
+    except Exception:
+        pass
+
+    # Environment-driven FFmpeg quiet options (picked up by subprocess / some wrappers)
+    os.environ.setdefault("FFMPEG_LOG_LEVEL", "quiet")
+    os.environ.setdefault("LIBAV_LOG_LEVEL", "quiet")
+    os.environ.setdefault("AV_LOG_FORCE_NOCOLOR", "1")
+
+    # Explicit libav log level (some builds respect AV_LOG_LEVEL)
+    os.environ.setdefault("AV_LOG_LEVEL", "quiet")
+
+    # Torch CUDA warnings that can be noisy in multi-GPU contexts (leave errors intact)
+    warnings.filterwarnings("ignore", message=r".*NVIDIA drivers are out of date.*")
+    warnings.filterwarnings("ignore", message=r".*Torch was not compiled with CUDA enabled.*")
+
+    print("[Info] Warning/log suppression active (set SUPPRESS_VLA_WARNINGS=0 to disable).")
 
 @dataclass
 class FinetuneConfig:
@@ -440,6 +520,7 @@ class FinetuneConfig:
     # revision version
     use_pro_version: bool = True                             # the version number
     phase: str = "Training"
+    suppress_warnings: bool = True                           # If True, suppresses noisy library warnings/logs
     # fmt: on
 
 
@@ -1035,6 +1116,9 @@ def finetune(cfg: FinetuneConfig) -> None:
     run_dir = cfg.run_root_dir / run_id
     os.makedirs(run_dir, exist_ok=True)
 
+    # Configure warning suppression early (before any heavy imports execute side effects)
+    configure_warning_suppression(cfg.suppress_warnings)
+
     # GPU setup
     distributed_state = PartialState()
     device_id = distributed_state.local_process_index
@@ -1340,7 +1424,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     }
 
     # Start training
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    import sys
+    with tqdm.tqdm(total=cfg.max_steps, leave=False, file=sys.stdout) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
