@@ -159,7 +159,10 @@ logs/
 wandb/
 
 # Pretrained Models
-pretrained_models/
+pretrained_models/prism-qwen25-extra-dinosiglip-224px-0_5b
+
+# Ignore backup config.json files in pretrained_models/configs
+pretrained_models/configs/config.json.back*
 
 # Outputs
 outputs/
